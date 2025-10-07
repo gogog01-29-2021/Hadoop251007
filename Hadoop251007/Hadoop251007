@@ -1,0 +1,318 @@
+
+## Booting of Course env (paths, users, etc.)
+$DEV1/scripts/training_setup_dev1.sh
+
+# Core services (Hive/Impala rely on these)
+sudo service zookeeper-server start
+sudo service hive-metastore start
+sudo service hive-server2 start
+sudo service impala-state-store start
+sudo service impala-catalog start
+sudo service impala-server start
+
+# Sanity check ports
+sudo netstat -plnt | egrep '10000|21000|9083' || true
+
+# HDFS quick ping
+hdfs dfs -ls /
+
+
+
+##HDFS CLI practice
+hdfs dfs -ls /
+hdfs dfs -mkdir -p /loudacre
+# assume sample data exists under $DEVIDATA; adjust if different
+cd "$DEVIDATA"
+hdfs dfs -put -f kb /loudacre/
+hdfs dfs -ls /loudacre/kb
+hdfs dfs -cat /loudacre/kb/KBDOC-00289.html | tail -n 20
+# optional cleanups
+# hdfs dfs -rm -r /loudacre/calllogs
+
+
+
+
+
+
+## Spark on YARN            Hue (web) Open Hue → Job Browser → verify app SUCCEEDED. YARN RM UI (web) Open ResourceManager UI → Applications → check your app and containers.
+cd $DEV1/exercises/yarn
+spark-submit --master yarn-cluster wordcount.py /loudacre/kb/*
+
+
+##SCOOP
+#Import account to HDFS
+# optional: start fresh
+hdfs dfs -rm -r -f /loudacre/accounts
+
+sqoop import \
+  --connect jdbc:mysql://localhost:3306/loudacre?useSSL=false \
+  --username training -P \
+  --table accounts \
+  --target-dir /loudacre/accounts \
+  --m 1
+# password prompt: training_pw
+
+# verify
+hdfs dfs -ls /loudacre/accounts
+hdfs dfs -cat /loudacre/accounts/part-m-* | head
+
+
+#Import account to HIVE
+sqoop import \
+  --connect jdbc:mysql://localhost:3306/loudacre?useSSL=false \
+  --username training -P \
+  --table accounts \
+  --hive-import \
+  --warehouse-dir /user/hive/warehouse \
+  --m 1
+# password: training_pw
+
+
+#Checking fit from BEELINE
+SHOW DATABASES;
+USE default;            -- or your chosen DB
+SHOW TABLES;
+SELECT COUNT(*) FROM accounts;
+!exit
+
+#Checking it from Impala
+-- impala-shell -i localhost:21000
+INVALIDATE METADATA;
+SHOW TABLES;
+SELECT COUNT(*) FROM accounts;
+quit
+
+
+## Bashsell import
+# find last value in MySQL
+mysql -h localhost -u training -p -e "SELECT MAX(acct_num) FROM loudacre.accounts;"
+# type training_pw
+
+# import only new rows appended after that MAX
+sqoop import \
+  --connect jdbc:mysql://localhost:3306/loudacre?useSSL=false \
+  --username training -P \
+  --table accounts \
+  --target-dir /loudacre/accounts_incremental \
+  --incremental append \
+  --check-column acct_num \
+  --last-value <PASTE_MAX_ACCT_NUM> \
+  --m 1
+
+# verify
+hdfs dfs -ls /loudacre/accounts_incremental
+hdfs dfs -cat /loudacre/accounts_incremental/part-m-* | head
+
+
+
+
+###Impala shell practice
+##From Impala shell
+-- impala-shell -i localhost:21000
+CREATE DATABASE IF NOT EXISTS practice;
+USE practice;
+
+-- example table from slides
+CREATE TABLE IF NOT EXISTS jobs (
+  id INT,
+  title STRING,
+  salary INT,
+  posted TIMESTAMP
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+CREATE TABLE IF NOT EXISTS jobs_archived LIKE jobs;
+
+SHOW TABLES;
+DESCRIBE jobs;
+SHOW CREATE TABLE jobs;
+
+-- if webpage was imported to Hive earlier:
+INVALIDATE METADATA;
+SELECT name FROM webpage WHERE name LIKE 'ifruit%' LIMIT 5;
+
+quit
+
+
+##Beeline practice  Joins and CTAS
+-- connect: beeline -u 'jdbc:hive2://localhost:10000/default' -n training
+
+-- if Sqoop imported these to Hive: device, accountdevice
+SHOW TABLES;
+USE default;
+
+-- join where device_id = 5
+SELECT d.*, a.*
+FROM device d
+JOIN accountdevice a
+  ON d.device_id = a.device_id
+WHERE d.device_id = 5;
+
+-- save to file and run
+!set outputformat csv
+!run join.sql    -- if you saved the query above to join.sql
+
+-- CTAS / EXTERNAL / LOCATION examples in practice DB
+CREATE DATABASE IF NOT EXISTS practice;
+USE practice;
+
+CREATE TABLE device_copy AS
+SELECT * FROM default.device;
+
+-- another CTAS example, filtered
+CREATE TABLE device_5 AS
+SELECT * FROM default.device WHERE device_num = 5;
+
+-- explicit LOCATION
+CREATE TABLE jobs_2 (
+  id INT, title STRING, salary INT, posted TIMESTAMP
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+LOCATION '/user/temp/';
+
+-- EXTERNAL table pointing to existing data
+CREATE EXTERNAL TABLE jobs_3 LIKE jobs
+LOCATION '/loudacre/ad_data';
+
+!exit
+
+
+###Datamodeling HW1 Overwrite vs 
+##In Bash shell
+# make 10/100/1000-line test files
+python - <<'PY' 10 > /tmp/ten_strings.txt
+import sys; n=int(sys.argv[1]); [print('str_%06d'%i) for i in range(n)]
+PY
+python - <<'PY' 100 > /tmp/hundred_strings.txt
+import sys; n=int(sys.argv[1]); [print('str_%06d'%i) for i in range(n)]
+PY
+python - <<'PY' 1000 > /tmp/thousand_strings.txt
+import sys; n=int(sys.argv[1]); [print('str_%06d'%i) for i in range(n)]
+PY
+
+hdfs dfs -mkdir -p /user/training/strings
+hdfs dfs -put -f /tmp/*_strings.txt /user/training/strings/
+
+## In Beeline or Impala
+CREATE DATABASE IF NOT EXISTS practice;
+USE practice;
+
+CREATE TABLE IF NOT EXISTS my_strings(s STRING)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\n'
+STORED AS TEXTFILE;
+
+LOAD DATA INPATH '/user/training/strings/thousand_strings.txt' INTO TABLE my_strings;
+SELECT COUNT(*) FROM my_strings;   -- 1000
+
+LOAD DATA INPATH '/user/training/strings/hundred_strings.txt' INTO TABLE my_strings;
+SELECT COUNT(*) FROM my_strings;   -- 1100 (append)
+
+LOAD DATA INPATH '/user/training/strings/ten_strings.txt' OVERWRITE INTO TABLE my_strings;
+SELECT COUNT(*) FROM my_strings;   -- 10 (overwrite)
+
+
+
+
+### Partitioning
+##In Beeline or Impala
+CREATE DATABASE IF NOT EXISTS practice;
+USE practice;
+
+CREATE TABLE IF NOT EXISTS my_strings(s STRING)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\n'
+STORED AS TEXTFILE;
+
+LOAD DATA INPATH '/user/training/strings/thousand_strings.txt' INTO TABLE my_strings;
+SELECT COUNT(*) FROM my_strings;   -- 1000
+
+LOAD DATA INPATH '/user/training/strings/hundred_strings.txt' INTO TABLE my_strings;
+SELECT COUNT(*) FROM my_strings;   -- 1100 (append)
+
+LOAD DATA INPATH '/user/training/strings/ten_strings.txt' OVERWRITE INTO TABLE my_strings;
+SELECT COUNT(*) FROM my_strings;   -- 10 (overwrite)
+
+
+##Static partitioning in Bash
+# tiny test files
+echo "1 ravi 100 hyd"    >  /tmp/test1.txt
+echo "2 krishna 200 hyd" >> /tmp/test1.txt
+echo "3 fff 300 sec"     >  /tmp/test2.txt
+
+hdfs dfs -mkdir -p /loudacre/test
+hdfs dfs -put -f /tmp/test1.txt /loudacre/test/
+hdfs dfs -put -f /tmp/test2.txt /loudacre/test/
+
+
+# in Beeline or Impala
+USE practice;
+
+CREATE EXTERNAL TABLE IF NOT EXISTS temp(
+  id INT, name STRING, sal INT
+)
+PARTITIONED BY (city STRING)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ' '
+LOCATION '/loudacre/test';
+
+ALTER TABLE temp ADD IF NOT EXISTS PARTITION (city='hyd');
+ALTER TABLE temp ADD IF NOT EXISTS PARTITION (city='sec');
+
+LOAD DATA INPATH '/loudacre/test/test1.txt'
+INTO TABLE temp PARTITION (city='hyd');
+
+LOAD DATA INPATH '/loudacre/test/test2.txt'
+INTO TABLE temp PARTITION (city='sec');
+
+SHOW PARTITIONS temp;
+SELECT * FROM temp WHERE city='hyd';
+SELECT * FROM temp WHERE city='sec';
+
+
+
+###Hue metastore
+SELECT * FROM device_meta WHERE device_num = 5;
+
+
+
+
+
+
+
+
+###H catalog practice
+
+hcat -e "CREATE TABLE vender(id INT, name STRING);"
+hcat -e "SHOW TABLES;"
+hcat -e "DESCRIBE vender;"
+hcat -e "DROP TABLE vender;"
+
+
+
+
+
+###Cross Engine Meta data sanity
+##In Beeline
+USE practice;
+CREATE TABLE beeline_test(x INT);
+SHOW TABLES;
+!exit
+
+##In Impala
+-- impala-shell -i localhost:21000
+INVALIDATE METADATA;
+SHOW TABLES;              -- beeline_test should now be visible
+DESCRIBE beeline_test;
+quit
+
+
+
+
+
+
+
+
+###
+
+
+
+
